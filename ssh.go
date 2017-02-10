@@ -5,16 +5,23 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/terminal"
+
+	log "github.com/Sirupsen/logrus"
+	shlex "github.com/flynn/go-shlex"
 )
 
 // sshSession stores the open session and connection to execute a command.
@@ -66,8 +73,9 @@ func updateFromSSHConfigFile(section *SSHConfigFileSection, host, user *string, 
 // newSSHClientConfig initializes per-host SSH configuration.
 func newSSHClientConfig(user, host string, section *SSHConfigFileSection, agt agent.Agent, method ssh.AuthMethod) *sshClientConfig {
 	config := &ssh.ClientConfig{
-		User: user,
-		Auth: []ssh.AuthMethod{method},
+		User:    user,
+		Auth:    []ssh.AuthMethod{method},
+		Timeout: 3 * time.Second, // FIXME: Timeout should be coming from CLI option
 	}
 	return &sshClientConfig{
 		agent:        agt,
@@ -76,12 +84,195 @@ func newSSHClientConfig(user, host string, section *SSHConfigFileSection, agt ag
 	}
 }
 
+type ProxyCommandConn struct {
+	Command string
+	Args    []string
+	Timeout time.Duration
+
+	writeDeadline time.Time
+
+	writeBuf chan byte
+	readBuf  chan byte
+}
+
+func newProxyCommandConn(c string, a []string, t time.Duration) *ProxyCommandConn {
+	conn := &ProxyCommandConn{
+		Command: c,
+		Args:    a,
+		Timeout: t,
+
+		readBuf:  make(chan byte, 1024),
+		writeBuf: make(chan byte, 1024),
+	}
+	return conn
+}
+
+func (c *ProxyCommandConn) Pipe() error {
+	cmd := exec.Command(c.Command, c.Args...)
+	c.SetDeadline(time.Now().Add(c.Timeout))
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	go func(f io.ReadCloser, c *ProxyCommandConn) {
+		b := make([]byte, 1024)
+		defer f.Close()
+		if l, _ := f.Read(b); l > 0 {
+			log.Errorf("ProxyCommand stderr: %q\n", b)
+		}
+	}(stderr, c)
+
+	go func(f io.WriteCloser, c *ProxyCommandConn) {
+		b := make([]byte, 1024)
+		defer f.Close()
+
+		for {
+			i := 0
+
+			for ; i < cap(b) && i < len(c.writeBuf); i++ {
+				b[i] = <-c.writeBuf
+			}
+
+			// Keep writing until all data available are written to f.
+			for w := 0; w < i; {
+				l, err := f.Write(b[w:i])
+				if err != nil {
+					log.Errorf("write error: %v", err)
+					return
+				}
+				w += l
+			}
+		}
+	}(stdin, c)
+
+	go func(f io.ReadCloser, c *ProxyCommandConn) {
+		b := make([]byte, 1024)
+		defer f.Close()
+
+		for {
+			l, err := f.Read(b)
+			if err != nil {
+				log.Errorf("read error: %v", err)
+				return
+			}
+
+			for _, i := range b[:l] {
+				c.readBuf <- i
+			}
+			// fmt.Printf("received %q\n", b[:l])
+		}
+	}(stdout, c)
+
+	if err := cmd.Wait(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *ProxyCommandConn) Read(b []byte) (int, error) {
+	b[0] = <-c.readBuf  // Block until data available in readBuf.
+	i := 1
+
+	for ; i < cap(b) && i < len(c.readBuf); i++ {
+		b[i] = <-c.readBuf
+	}
+
+	return i, nil
+}
+
+func (c *ProxyCommandConn) Write(b []byte) (int, error) {
+	// FIXME: Implement timeout
+	for _, i := range b {
+		c.writeBuf <- i
+	}
+	// fmt.Printf("wrote %q\n", b)
+
+	return len(b), nil
+}
+
+func (c *ProxyCommandConn) Close() error {
+	// FIXME: Quit read/write goroutine
+	// cmd := exec.Command("ps", "aux")
+	// if o, err := cmd.CombinedOutput(); err == nil {
+	// 	fmt.Printf("%s", o)
+	// } else {
+	// 	return err
+	// }
+	// if err := cmd.Run(); err != nil {
+	// 	return err
+	// }
+
+	return nil
+}
+
+func (c *ProxyCommandConn) LocalAddr() net.Addr {
+	return nil
+}
+
+func (c *ProxyCommandConn) RemoteAddr() net.Addr {
+	return nil
+}
+
+func (c *ProxyCommandConn) SetDeadline(t time.Time) error {
+	c.SetReadDeadline(t)
+	c.SetWriteDeadline(t)
+	return nil
+}
+
+func (c *ProxyCommandConn) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (c *ProxyCommandConn) SetWriteDeadline(t time.Time) error {
+	c.writeDeadline = t
+	return nil
+}
+
 // NewSession creates a new ssh session with the host.
 // It forwards authentication to the agent when it's configured.
-func (s *sshClientConfig) NewSession() (*sshSession, error) {
-	conn, err := ssh.Dial("tcp", s.host, s.ClientConfig)
-	if err != nil {
-		return nil, err
+func (s *sshClientConfig) NewSession(options map[string]string) (*sshSession, error) {
+	var (
+		conn *ssh.Client
+		err  error
+	)
+
+	if proxyCmd, ok := options["ProxyCommand"]; ok {
+		host, port, _ := net.SplitHostPort(s.host)
+		proxyCmd = strings.Replace(proxyCmd, "%h", host, -1)
+		proxyCmd = strings.Replace(proxyCmd, "%p", port, -1)
+		args, err := shlex.Split(proxyCmd)
+		if err != nil {
+			return nil, err
+		}
+		log.Debugf("running ProxyCommand: %s", proxyCmd)
+
+		cmdConn := newProxyCommandConn(args[0], args[1:], s.ClientConfig.Timeout)
+		go cmdConn.Pipe()
+
+		c, chans, reqs, err := ssh.NewClientConn(cmdConn, "", s.ClientConfig)
+		if err != nil {
+			return nil, err
+		}
+		conn = ssh.NewClient(c, chans, reqs)
+	} else {
+		conn, err = ssh.Dial("tcp", s.host, s.ClientConfig)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if s.agent != nil {
@@ -93,6 +284,10 @@ func (s *sshClientConfig) NewSession() (*sshSession, error) {
 	session, err := conn.NewSession()
 	if s.agent != nil {
 		err = agent.RequestAgentForwarding(session)
+	}
+
+	if err != nil {
+		return nil, err
 	}
 
 	return &sshSession{
